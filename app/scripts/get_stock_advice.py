@@ -7,7 +7,7 @@ import requests
 import warnings
 import urllib.parse
 import pandas as pd
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment
 from datetime import datetime
 from tqdm.asyncio import tqdm_asyncio
 
@@ -77,7 +77,9 @@ def get_target_percent(start_price, target_price):
 async def get_stock_price(company_code, date_string, call, target_price):
     if date_string is None:
         return None, None, None
-    if "AM" in date_string or "PM" in date_string:
+    if isinstance(date_string, datetime):
+        from_date = date_string
+    elif "AM" in date_string or "PM" in date_string:
         from_date = datetime.strptime(date_string, "%B %d, %Y %I:%M %p")
     else:
         from_date = datetime.strptime(date_string, "%B %d, %Y")
@@ -221,9 +223,20 @@ def get_percent_change(price_on_article, target_price, today_price):
     return arbitrage, today_pl
 
 
+def get_article_time(news):
+    article_time = news.find("span")
+    if article_time is not None:
+        return article_time.text
+    for element in news(text=lambda text: isinstance(text, Comment)):
+        if "span" in element:
+            comment_soup = BeautifulSoup(element, "html.parser")
+            article_time = comment_soup.find("span")
+            return article_time.text
+
+
 async def get_article_details(news):
     article_title = news.find("a").get("title")
-    article_time = news.find("span").text
+    article_time = get_article_time(news)
     target_price = int(
         re.search(r"target of Rs ([\d,]+)", article_title).group(1).replace(",", "")
     )
@@ -236,21 +249,12 @@ async def get_article_details(news):
         company_code = await get_company_code(stock_pricequote_url)
     except Exception as e:
         company_code = await get_company_code_from_name(stock_name)
-    try:
-        price_at_article_date, todays_price, days_to_reach_target = (
-            await get_stock_price(
-                company_code,
-                article_time.rsplit(" ", 1)[0],
-                buy_sell_hold,
-                target_price,
-            )
-        )
-    except Exception as e:
-        price_at_article_date, todays_price, days_to_reach_target = (
-            None,
-            None,
-            None,
-        )
+    price_at_article_date, todays_price, days_to_reach_target = await get_stock_price(
+        company_code,
+        article_time.rsplit(" ", 1)[0],
+        buy_sell_hold,
+        target_price,
+    )
 
     arbitrage, today_pl = get_percent_change(
         price_at_article_date, target_price, todays_price
@@ -272,19 +276,64 @@ async def get_article_details(news):
     ]
 
 
-def get_recent_articles():
+async def get_data(row):
+    company_code = row["Company Code"]
+    article_time = row["Article Date"]
+    buy_sell_hold = row["Call"]
+    target_price = row["Target Price"]
+    # convert article time to datetime
+    if isinstance(article_time, str):
+        article_time = datetime.strptime(article_time, "%Y-%m-%d %H:%M:%S")
+    price_at_article_date, todays_price, days_to_reach_target = await get_stock_price(
+        company_code,
+        article_time,
+        buy_sell_hold,
+        target_price,
+    )
 
+    arbitrage, today_pl = get_percent_change(
+        price_at_article_date, target_price, todays_price
+    )
+    return (
+        todays_price,
+        days_to_reach_target,
+        arbitrage,
+        today_pl,
+    )
+
+
+async def update_df_stock_price(df):
+    tasks = [get_data(row[1]) for row in df.iterrows()]
+    results = await asyncio.gather(*tasks)
+    for i, result in enumerate(results):
+        (
+            df.at[i, "Today's Price"],
+            df.at[i, "Time to reach target"],
+            df.at[i, "Arbitrage %"],
+            df.at[i, "Today P/L %"],
+        ) = result
+
+
+def get_recent_articles():
+    global stock_advice_df
     total_pages = 30
     current_page = 1
     tasks = []
 
+    CURRENT_DIR = os.path.dirname(os.path.realpath(__file__))
+    DATA_PATH = os.path.abspath(
+        os.path.join(CURRENT_DIR, "..", "..", "data", "stock_advice.csv")
+    )
+    stock_advice_df = pd.read_csv(DATA_PATH)
+    stock_advice_df["Article Date"] = pd.to_datetime(stock_advice_df["Article Date"])
+    stop_date = stock_advice_df["Article Date"].iloc[-1]
+
+    is_stopped = False
     while current_page <= total_pages:
         response = requests.get(
             recent_stock_advice_url.format(page_number=current_page)
         )
         soup = BeautifulSoup(response.text, "html.parser")
-
-        stop_date = datetime.now()
 
         for news in soup.find("ul", {"id": "cagetory"}).find_all(
             "li", id=lambda x: x and x.startswith("newslist-")
@@ -292,27 +341,31 @@ def get_recent_articles():
             article_title = news.find("a").get("title")
             if "target of" not in article_title:
                 continue
-            article_time = news.find("span").text
 
-            # _article_time = datetime.strptime(
-            #     article_time.rsplit(" ", 1)[0], "%B %d, %Y %I:%M %p"
-            # )
-            # if _article_time > stop_date:
-            #     break
+            article_time = get_article_time(news)
+
+            _article_time = pd.to_datetime(article_time)
+            if _article_time < stop_date:
+                is_stopped = True
+                break
             tasks.append(get_article_details(news))
         current_page += 1
+        if is_stopped:
+            break
 
     eventloop = asyncio.get_event_loop()
     eventloop.run_until_complete(tqdm_asyncio.gather(*tasks))
 
     # sort by "Article Date" and save
     stock_advice_df.sort_values(by="Article Date", inplace=True)
-    CURRENT_DIR = os.path.dirname(os.path.realpath(__file__))
-    DATA_PATH = os.path.abspath(
-        os.path.join(CURRENT_DIR, "..", "..", "data", "stock_advice.csv")
-    )
+
     stock_advice_df.to_csv(DATA_PATH, index=False)
-    print(f"Stock advice saved to {DATA_PATH}")
+    print(f"Added {len(tasks)} stock advices to {DATA_PATH}")
+
+    print("Updating the stock prices...")
+    eventloop.run_until_complete(update_df_stock_price(stock_advice_df))
+    stock_advice_df.to_csv(DATA_PATH, index=False)
+    print(f"Stock advice updated in {DATA_PATH}")
 
 
 def get_old_articles():

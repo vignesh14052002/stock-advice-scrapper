@@ -2,8 +2,9 @@
 name = "app"
 version = "0.1.0"
 description = ""
-authors = ["vignesh-14052002<vignesharivazhagan1409@gmail.com>"]
+authors = ["vignesh-14052002 <vignesharivazhagan1409@gmail.com>"]
 readme = "README.md"
+packages = [{ include = "scripts" }]
 
 [tool.poetry.dependencies]
 python = "^3.11"
