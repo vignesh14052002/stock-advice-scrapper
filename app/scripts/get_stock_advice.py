@@ -104,6 +104,8 @@ async def get_stock_price(company_code, date_string, call, target_price):
             ),
             headers=headers,
         )
+        if "c" not in response:
+            print(response, company_code)
         closing_prices = response["c"]
         if actual_num_days == 0:
             closing_prices = [closing_prices[-1]]
@@ -114,10 +116,19 @@ async def get_stock_price(company_code, date_string, call, target_price):
         days_to_reach_target = get_days_to_reach_target(
             call, closing_prices, target_price
         )
-        return price_at_article_date, todays_price, days_to_reach_target
+        arbitrage, today_pl = get_percent_change(
+            call, price_at_article_date, target_price, todays_price
+        )
+        return (
+            price_at_article_date,
+            todays_price,
+            days_to_reach_target,
+            arbitrage,
+            today_pl,
+        )
     except Exception as e:
-        print(e)
-        return None, None, None
+        # print("Error getting stock price", repr(e))
+        return None, None, None, None, None
 
 
 def get_days_to_reach_target(call, history, target_price):
@@ -154,11 +165,8 @@ async def get_stock_info(news):
         re.search(r"target of Rs ([\d,]+)", article_title).group(1).replace(",", "")
     )
     article_time = await get_article_time(article_url)
-    price_at_article_date, todays_price, days_to_reach_target = await get_stock_price(
-        company_code, article_time, buy_sell_hold, target_price
-    )
-    arbitrage, today_pl = get_percent_change(
-        price_at_article_date, target_price, todays_price
+    price_at_article_date, todays_price, days_to_reach_target, arbitrage, today_pl = (
+        await get_stock_price(company_code, article_time, buy_sell_hold, target_price)
     )
     # Append to the dataframe
     stock_advice_df.loc[len(stock_advice_df)] = [
@@ -209,17 +217,25 @@ async def get_company_code_from_name(stock_name):
     try:
         company_code = data["quotes"][0]["symbol"]
     except Exception as e:
+        # print("Error getting company code", e)
         return None
     return company_code.split(".")[0]
 
 
-def get_percent_change(price_on_article, target_price, today_price):
+def get_percent_change(call, price_on_article, target_price, today_price):
+    call = call.strip().lower()
+    sell_variants = ["sell", "reduce"]
+
     arbitrage = None
     today_pl = None
     if price_on_article and target_price:
         arbitrage = get_target_percent(price_on_article, target_price)
     if price_on_article and today_price:
         today_pl = get_target_percent(price_on_article, today_price)
+
+    if call in sell_variants:
+        arbitrage = -arbitrage
+        today_pl = -today_pl
     return arbitrage, today_pl
 
 
@@ -249,16 +265,15 @@ async def get_article_details(news):
         company_code = await get_company_code(stock_pricequote_url)
     except Exception as e:
         company_code = await get_company_code_from_name(stock_name)
-    price_at_article_date, todays_price, days_to_reach_target = await get_stock_price(
-        company_code,
-        article_time.rsplit(" ", 1)[0],
-        buy_sell_hold,
-        target_price,
+    price_at_article_date, todays_price, days_to_reach_target, arbitrage, today_pl = (
+        await get_stock_price(
+            company_code,
+            article_time.rsplit(" ", 1)[0],
+            buy_sell_hold,
+            target_price,
+        )
     )
 
-    arbitrage, today_pl = get_percent_change(
-        price_at_article_date, target_price, todays_price
-    )
     # Append to the dataframe
     stock_advice_df.loc[len(stock_advice_df)] = [
         pd.to_datetime(article_time),
@@ -276,7 +291,7 @@ async def get_article_details(news):
     ]
 
 
-async def get_data(row):
+async def get_data(i, row):
     company_code = row["Company Code"]
     article_time = row["Article Date"]
     buy_sell_hold = row["Call"]
@@ -284,15 +299,13 @@ async def get_data(row):
     # convert article time to datetime
     if isinstance(article_time, str):
         article_time = datetime.strptime(article_time, "%Y-%m-%d %H:%M:%S")
-    price_at_article_date, todays_price, days_to_reach_target = await get_stock_price(
-        company_code,
-        article_time,
-        buy_sell_hold,
-        target_price,
-    )
-
-    arbitrage, today_pl = get_percent_change(
-        price_at_article_date, target_price, todays_price
+    price_at_article_date, todays_price, days_to_reach_target, arbitrage, today_pl = (
+        await get_stock_price(
+            company_code,
+            article_time,
+            buy_sell_hold,
+            target_price,
+        )
     )
     return (
         todays_price,
@@ -303,8 +316,9 @@ async def get_data(row):
 
 
 async def update_df_stock_price(df):
-    tasks = [get_data(row[1]) for row in df.iterrows()]
+    tasks = [get_data(i, row[1]) for i, row in enumerate(df.iterrows())]
     results = await asyncio.gather(*tasks)
+    print("RRRR", len(results), df.at[453, "Company Code"])
     for i, result in enumerate(results):
         (
             df.at[i, "Today's Price"],
