@@ -251,15 +251,19 @@ def get_article_time(news):
 
 
 async def get_article_details(news):
-    article_title = news.find("a").get("title")
-    article_time = get_article_time(news)
-    target_price = int(
-        re.search(r"target of Rs ([\d,]+)", article_title).group(1).replace(",", "")
-    )
-    buy_sell_hold, *stock_name = article_title.split(";")[0].split(" ")
-    stock_name = " ".join(stock_name)
-    advisor_name = article_title.split(":")[-1].strip()
-    article_link = news.find("a").get("href")
+    try:
+        article_title = news.find("a").get("title")
+        article_time = get_article_time(news)
+        target_price = int(
+            re.search(r"target of Rs ([\d,]+)", article_title).group(1).replace(",", "")
+        )
+        buy_sell_hold, *stock_name = article_title.split(";")[0].split(" ")
+        stock_name = " ".join(stock_name)
+        advisor_name = article_title.split(":")[-1].strip()
+        article_link = news.find("a").get("href")
+    except Exception as e:
+        print("Error getting article details", e)
+        return
     try:
         stock_pricequote_url = await get_pricequote_url(article_link)
         company_code = await get_company_code(stock_pricequote_url)
@@ -328,22 +332,9 @@ async def update_df_stock_price(df):
         ) = result
 
 
-def get_recent_articles():
-    global stock_advice_df
-    total_pages = 30
-    current_page = 1
+def _get_article_details_tasks(total_pages_to_scrape, stop_date):
     tasks = []
-
-    CURRENT_DIR = os.path.dirname(os.path.realpath(__file__))
-    DATA_PATH = os.path.abspath(
-        os.path.join(CURRENT_DIR, "..", "..", "data", "stock_advice.csv")
-    )
-    stock_advice_df = pd.read_csv(DATA_PATH)
-    stock_advice_df["Article Date"] = pd.to_datetime(stock_advice_df["Article Date"])
-    stop_date = stock_advice_df["Article Date"].iloc[-1]
-
-    is_stopped = False
-    while current_page <= total_pages:
+    for current_page in range(1, total_pages_to_scrape):
         response = requests.get(
             recent_stock_advice_url.format(page_number=current_page)
         )
@@ -360,12 +351,26 @@ def get_recent_articles():
 
             _article_time = pd.to_datetime(article_time)
             if _article_time < stop_date:
-                is_stopped = True
-                break
+                return tasks
             tasks.append(get_article_details(news))
-        current_page += 1
-        if is_stopped:
-            break
+    return tasks
+
+
+def get_recent_articles():
+    global stock_advice_df
+
+    CURRENT_DIR = os.path.dirname(os.path.realpath(__file__))
+    DATA_PATH = os.path.abspath(
+        os.path.join(CURRENT_DIR, "..", "..", "data", "stock_advice.csv")
+    )
+    stock_advice_df = pd.read_csv(DATA_PATH)
+
+    # Convert Date for sorting
+    stock_advice_df["Article Date"] = pd.to_datetime(stock_advice_df["Article Date"])
+    stop_date = stock_advice_df["Article Date"].iloc[-1]
+
+    total_pages_to_scrape = 30
+    tasks = _get_article_details_tasks(total_pages_to_scrape, stop_date)
 
     eventloop = asyncio.get_event_loop()
     eventloop.run_until_complete(tqdm_asyncio.gather(*tasks))
